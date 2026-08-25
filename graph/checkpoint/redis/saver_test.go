@@ -898,7 +898,8 @@ func TestRedis_List_WithBeforeAndCrossNamespace(t *testing.T) {
 		assert.True(t, tu.Checkpoint.ID == ck1.ID || tu.Checkpoint.ID == ck2.ID)
 	}
 
-	// Namespace-specific list with Before(ck3) in nsA should return only ck1
+	// Namespace-specific list with Before(ck3) in nsA should return ck2 first
+	// (descending order by timestamp), then ck1.
 	cfgNsA := graph.CreateCheckpointConfig(lineageID, "", "nsA")
 	filter2 := graph.NewCheckpointFilter().WithBefore(graph.CreateCheckpointConfig(lineageID, ck3.ID, "nsA"))
 	tuples2, err := saver.List(ctx, cfgNsA, filter2)
@@ -907,9 +908,81 @@ func TestRedis_List_WithBeforeAndCrossNamespace(t *testing.T) {
 	for _, tu := range tuples2 {
 		assert.NotEqual(t, tu.Checkpoint.ID, ck3.ID)
 	}
-	if len(tuples2) > 0 {
-		assert.Equal(t, ck1.ID, tuples2[0].Checkpoint.ID)
+	// Descending order: ck2 immediately precedes ck3.
+	require.NotEmpty(t, tuples2)
+	assert.Equal(t, ck2.ID, tuples2[0].Checkpoint.ID)
+	if len(tuples2) > 1 {
+		assert.Equal(t, ck1.ID, tuples2[1].Checkpoint.ID)
 	}
+}
+
+// TestRedis_List_WithBefore_ReturnsDescending verifies that List with
+// filter.Before returns checkpoints in descending timestamp order
+// (newest first), matching the inmemory and sqlite implementations.
+//
+// Regression for #2503: the Redis saver previously used ZRangeByScore
+// which traverses sorted sets in ascending order, so callers paging
+// backwards with {Before: cfg, Limit: 1} received the oldest checkpoint
+// in history instead of the checkpoint immediately preceding the
+// reference ID.
+func TestRedis_List_WithBefore_ReturnsDescending(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	saver, err := NewSaver(WithRedisClientURL(redisURL))
+	require.NoError(t, err)
+	defer saver.Close()
+
+	ctx := context.Background()
+	lineageID := "ln-before-desc"
+
+	ck1 := graph.NewCheckpoint(map[string]any{"i": 1}, map[string]int64{"i": 1}, nil)
+	_, err = saver.Put(ctx, graph.PutRequest{
+		Config:      graph.CreateCheckpointConfig(lineageID, "", "nsA"),
+		Checkpoint:  ck1,
+		Metadata:    graph.NewCheckpointMetadata(graph.CheckpointSourceInput, 0),
+		NewVersions: map[string]int64{"i": 1},
+	})
+	require.NoError(t, err)
+	time.Sleep(10 * time.Millisecond)
+	ck2 := graph.NewCheckpoint(map[string]any{"i": 2}, map[string]int64{"i": 2}, nil)
+	_, err = saver.Put(ctx, graph.PutRequest{
+		Config:      graph.CreateCheckpointConfig(lineageID, "", "nsA"),
+		Checkpoint:  ck2,
+		Metadata:    graph.NewCheckpointMetadata(graph.CheckpointSourceLoop, 1),
+		NewVersions: map[string]int64{"i": 2},
+	})
+	require.NoError(t, err)
+	time.Sleep(10 * time.Millisecond)
+	ck3 := graph.NewCheckpoint(map[string]any{"i": 3}, map[string]int64{"i": 3}, nil)
+	_, err = saver.Put(ctx, graph.PutRequest{
+		Config:      graph.CreateCheckpointConfig(lineageID, "", "nsA"),
+		Checkpoint:  ck3,
+		Metadata:    graph.NewCheckpointMetadata(graph.CheckpointSourceLoop, 2),
+		NewVersions: map[string]int64{"i": 3},
+	})
+	require.NoError(t, err)
+
+	cfgNsA := graph.CreateCheckpointConfig(lineageID, "", "nsA")
+	filter := &graph.CheckpointFilter{
+		Before: graph.CreateCheckpointConfig(lineageID, ck3.ID, "nsA"),
+		Limit:  1,
+	}
+	tuples, err := saver.List(ctx, cfgNsA, filter)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(tuples), "Limit=1 should return exactly one checkpoint")
+	assert.Equal(t, ck2.ID, tuples[0].Checkpoint.ID,
+		"Before(ck3)+Limit=1 must return ck2 (newest before ck3), not ck1")
+
+	// Without Limit, every other checkpoint in the lineage should be
+	// returned in descending timestamp order.
+	allTuples, err := saver.List(ctx, cfgNsA, &graph.CheckpointFilter{
+		Before: graph.CreateCheckpointConfig(lineageID, ck3.ID, "nsA"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, len(allTuples))
+	assert.Equal(t, ck2.ID, allTuples[0].Checkpoint.ID)
+	assert.Equal(t, ck1.ID, allTuples[1].Checkpoint.ID)
 }
 
 func TestRedis_List_CrossNamespace_Limit1(t *testing.T) {

@@ -366,7 +366,10 @@ func (s *Saver) getCheckpointIDs(ctx context.Context, lineageID, checkpointNS st
 				return nil, err
 			}
 			if beforeScore > 0 {
-				members, err = s.client.ZRangeByScore(ctx, key, &redis.ZRangeBy{
+				// Traverse in descending order to match the contract of the
+				// other Saver implementations and the default path below,
+				// which returns the newest checkpoint first.
+				members, err = s.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 					Min: "0",
 					Max: fmt.Sprintf("(%d", beforeScore),
 				}).Result()
